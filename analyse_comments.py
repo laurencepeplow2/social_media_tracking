@@ -35,7 +35,7 @@ import logging
 import os
 import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -68,6 +68,7 @@ MEP_TWITTER_COLUMN_INDEX = 20  # column U
 MEP_HEADER_ROW_INDEX = 1       # row 2 in the sheet (row 1 is a section banner)
 
 FULL_DATASET_TAB = "full_dataset"
+CHECKS_TAB = "automated_checks"
 
 PLATFORM_TYPE_BY_HOST: dict[frozenset[str], str] = {
     frozenset(X_HOSTS): "twitter",
@@ -384,6 +385,177 @@ def build_group_rows(group_name: str, group: dict, processed: list[ProcessedComm
     return rows
 
 
+def run_checks(
+    service_account_file: Path,
+    mep_spreadsheet_id: str,
+    config_spreadsheet_id: str,
+    comments_csv: Path,
+) -> list[tuple[str, str, str]]:
+    """Run 10 environment/data checks. Returns rows of (description, pass_detail, fail_detail)."""
+    results: list[tuple[str, str, str]] = []
+
+    def passed(desc: str, detail: str = "ok") -> None:
+        results.append((desc, detail, ""))
+
+    def failed(desc: str, detail: str) -> None:
+        results.append((desc, "", detail))
+
+    # Shared state across checks — populated as earlier checks succeed
+    creds = None
+    service = None
+    config_kv: dict[str, str] = {}
+    questions: list[Question] = []
+
+    # 1. service account file
+    desc = "Service account credentials present and parseable"
+    try:
+        if not service_account_file.exists():
+            raise FileNotFoundError(f"{service_account_file} does not exist")
+        creds = Credentials.from_service_account_file(str(service_account_file), scopes=SCOPES)
+        passed(desc, f"loaded {service_account_file.name}")
+    except Exception as e:
+        failed(desc, f"{type(e).__name__}: {e}")
+
+    # 2. read access to config sheet
+    desc = "Read access to social_media_tracking sheet"
+    if creds is None:
+        failed(desc, "skipped: service account didn't load")
+    else:
+        try:
+            service = build("sheets", "v4", credentials=creds, cache_discovery=False)
+            meta = service.spreadsheets().get(spreadsheetId=config_spreadsheet_id).execute()
+            passed(desc, f"{meta['properties']['title']} ({len(meta['sheets'])} tabs)")
+        except Exception as e:
+            failed(desc, f"{type(e).__name__}: {e}")
+
+    # 3. read access to T&E MEPs tab
+    desc = f"Read access to T&E MEPs tab ('{MEP_TAB}')"
+    if service is None:
+        failed(desc, "skipped: sheets service not initialised")
+    else:
+        try:
+            meta = service.spreadsheets().get(spreadsheetId=mep_spreadsheet_id).execute()
+            tabs = {s["properties"]["title"] for s in meta["sheets"]}
+            if MEP_TAB not in tabs:
+                failed(desc, f"tab '{MEP_TAB}' missing from T&E sheet")
+            else:
+                passed(desc, f"'{MEP_TAB}' present, {len(tabs)} tabs total")
+        except Exception as e:
+            failed(desc, f"{type(e).__name__}: {e}")
+
+    # 4. required config keys present and non-empty
+    desc = "Config has all required keys"
+    required_keys = ["claude_model_selection", "claude_role", "minimum_characters", "include_past_days"]
+    if service is None:
+        failed(desc, "skipped")
+    else:
+        try:
+            rows = service.spreadsheets().values().get(
+                spreadsheetId=config_spreadsheet_id, range="config",
+            ).execute().get("values", [])
+            config_kv = {r[0].strip(): r[1].strip() for r in rows if len(r) >= 2 and r[0].strip()}
+            missing = [k for k in required_keys if not config_kv.get(k)]
+            if missing:
+                failed(desc, f"missing or empty: {missing}")
+            else:
+                passed(desc, f"{len(required_keys)} keys present")
+        except Exception as e:
+            failed(desc, f"{type(e).__name__}: {e}")
+
+    # 5. minimum_characters parseable as non-negative int
+    desc = "minimum_characters is a non-negative integer"
+    try:
+        v = int(config_kv.get("minimum_characters", ""))
+        if v < 0:
+            failed(desc, f"got {v}, must be >= 0")
+        else:
+            passed(desc, f"= {v}")
+    except (ValueError, KeyError) as e:
+        failed(desc, f"could not parse value {config_kv.get('minimum_characters', '')!r}")
+
+    # 6. include_past_days parseable as non-negative int
+    desc = "include_past_days is a non-negative integer"
+    try:
+        v = int(config_kv.get("include_past_days", ""))
+        if v < 0:
+            failed(desc, f"got {v}, must be >= 0")
+        else:
+            passed(desc, f"= {v}")
+    except (ValueError, KeyError):
+        failed(desc, f"could not parse value {config_kv.get('include_past_days', '')!r}")
+
+    # 7. at least one question loaded with non-empty question_tag
+    desc = "At least one question loaded with question_tag"
+    if service is None:
+        failed(desc, "skipped")
+    else:
+        try:
+            questions = load_questions(service, config_spreadsheet_id)
+            if not questions:
+                failed(desc, "questions_for_ai tab returned 0 questions")
+            else:
+                tagless = [q.question_id for q in questions if not q.question_tag]
+                if tagless:
+                    failed(desc, f"{len(tagless)} question(s) missing tag: {tagless}")
+                else:
+                    passed(desc, f"{len(questions)} question(s) loaded")
+        except Exception as e:
+            failed(desc, f"{type(e).__name__}: {e}")
+
+    # 8. each question_group has exactly one root
+    desc = "Each question_group has exactly one root question"
+    if not questions:
+        failed(desc, "skipped: no questions loaded")
+    else:
+        roots = Counter(q.question_group for q in questions if q.question_type == "root")
+        all_groups = {q.question_group for q in questions if q.question_group}
+        no_root = sorted(all_groups - set(roots))
+        multi = sorted(g for g, n in roots.items() if n > 1)
+        issues = []
+        if no_root:
+            issues.append(f"no root in: {no_root}")
+        if multi:
+            issues.append(f"multiple roots in: {multi}")
+        if issues:
+            failed(desc, "; ".join(issues))
+        else:
+            passed(desc, f"{len(all_groups)} group(s) ok")
+
+    # 9. all question_tags unique
+    desc = "All question_tags are unique"
+    if not questions:
+        failed(desc, "skipped: no questions loaded")
+    else:
+        counts = Counter(q.question_tag for q in questions if q.question_tag)
+        dups = [t for t, n in counts.items() if n > 1]
+        if dups:
+            failed(desc, f"duplicate tags: {dups}")
+        else:
+            passed(desc, f"{len(counts)} unique tag(s)")
+
+    # 10. Anthropic API key configured + reachable + structured outputs working
+    desc = "Anthropic API key configured and reachable"
+    model = config_kv.get("claude_model_selection") or "claude-haiku-4-5"
+    try:
+        client = anthropic.Anthropic()
+        resp = client.messages.create(
+            model=model,
+            max_tokens=32,
+            messages=[{"role": "user", "content": "Reply 'no'."}],
+            output_config={"format": {"type": "json_schema", "schema": VERDICT_SCHEMA}},
+        )
+        text = next((b.text for b in resp.content if b.type == "text"), "{}")
+        verdict = json.loads(text).get("verdict")
+        if verdict not in ("yes", "no"):
+            failed(desc, f"got unexpected verdict {verdict!r}")
+        else:
+            passed(desc, f"test call ok ({resp.usage.input_tokens}+{resp.usage.output_tokens} tokens, model={model})")
+    except Exception as e:
+        failed(desc, f"{type(e).__name__}: {e}")
+
+    return results
+
+
 def write_to_sheet(service, spreadsheet_id: str, tab: str, rows: list[list]) -> None:
     service.spreadsheets().values().clear(
         spreadsheetId=spreadsheet_id, range=tab, body={},
@@ -477,7 +649,27 @@ def main() -> int:
         logging.error(f"Missing input file: {comments_csv}")
         return 1
 
-    service = sheets_service(service_account_file)
+    # Run automated checks first and post results to the sheet
+    logging.info("Running automated checks...")
+    check_results = run_checks(service_account_file, mep_spreadsheet_id, config_spreadsheet_id, comments_csv)
+    n_pass = sum(1 for _, p, _ in check_results if p)
+    n_fail = sum(1 for _, _, f in check_results if f)
+    for desc, p, f in check_results:
+        status = "PASS" if p else "FAIL"
+        logging.info(f"  [{status}] {desc}: {p or f}")
+    logging.info(f"Checks: {n_pass} pass, {n_fail} fail")
+    try:
+        service = sheets_service(service_account_file)
+        write_to_sheet(
+            service, config_spreadsheet_id, CHECKS_TAB,
+            [["description", "pass", "fail"]] + [list(r) for r in check_results],
+        )
+        logging.info(f"Wrote check results to '{CHECKS_TAB}' tab")
+    except Exception as e:
+        logging.error(f"Failed to write check results to sheet: {type(e).__name__}: {e}")
+        service = sheets_service(service_account_file)
+    if n_fail:
+        logging.warning(f"{n_fail} check(s) failed — continuing anyway. Review '{CHECKS_TAB}' tab.")
 
     logging.info(f"Reading config from {config_spreadsheet_id}")
     config = load_config(service, config_spreadsheet_id)
