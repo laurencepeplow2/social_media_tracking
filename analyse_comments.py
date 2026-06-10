@@ -1,20 +1,31 @@
-"""Run each comment through Claude, write results back to the full_dataset tab.
+"""Run each comment through Claude, write results back to Google Sheets.
 
-Behaviours in this version:
-- Follow-up gating: each `question_group` has one `root` question and zero or
-  more `follow_up`s. Follow-ups only run when the root verdict is "yes".
+Outputs written to the social_media_tracking sheet:
+
+  - `full_dataset` tab — one wide row per comment with every question's
+    verdict + justification.
+  - One tab per question_group (e.g. `EVs_CO2_standards`) — filtered to
+    rows where that group's root verdict is "yes", and showing only that
+    group's follow-up question columns. Tab is only written if it
+    already exists in the sheet (so adding a question_group is a no-op
+    until the user creates a matching tab).
+
+Behaviours:
+- Date filter (`include_past_days` in config): drop comments whose
+  DDMMYYYY timestamp is more than N days before today.
+- Follow-up gating: each `question_group` has one `root` question and
+  zero or more `follow_up`s. Follow-ups only run when the root verdict
+  is "yes" — saves ~⅔ of API calls on off-topic posts.
 - Structured outputs (`output_config.format` json_schema) so the verdict
   enum and one-sentence justification are guaranteed parseable.
-- Prompt caching: the (role + question) prefix is sent as cacheable system
-  blocks. Below Haiku 4.5's 4K-token cache threshold today — `usage` will
-  show `cache_creation`/`cache_read_input_tokens = 0` until the role grows
-  — but the request shape is correct for when prompts expand.
-- Left-join MEP metadata (Last Name, First Name, Country, Group, National
-  party, New vs. re-elected, ENVI, TRAN, ITRE) from column U of the "MEPs "
-  tab on the T&E sheet. Join key is the canonical X/Twitter URL.
-- One wide row per comment is written to the `full_dataset` tab of the
-  social_media_tracking sheet, prefixed with the joined MEP fields and
-  suffixed with one (verdict, justification) pair per question.
+- Prompt caching: the (role + question) prefix is sent as cacheable
+  system blocks. Below Haiku 4.5's ~4K-token cache threshold today —
+  request shape is correct for when prompts grow.
+- Left-join MEP metadata (Last Name, First Name, Country, Group,
+  National party, New vs. re-elected, ENVI, TRAN, ITRE) from column U
+  of the "MEPs " tab on the T&E mapping sheet.
+- `social_media_type` column derived from the URL host
+  (x.com → "twitter", facebook.com → "facebook", etc.).
 """
 from __future__ import annotations
 
@@ -25,26 +36,30 @@ import os
 import sys
 import time
 from collections import defaultdict
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlparse
 
 import anthropic
 from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
-from extract_handles import Handle, cell_hyperlink, normalise
+from extract_handles import (
+    FACEBOOK_HOSTS, INSTAGRAM_HOSTS, X_HOSTS,
+    Handle, cell_hyperlink, normalise,
+)
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-PRICE_PER_MTOK = {  # Haiku 4.5 per Anthropic pricing
+PRICE_PER_MTOK = {  # Haiku 4.5
     "input": 1.0,
     "output": 5.0,
-    "cache_write": 1.25,   # 1.25× input for 5-min TTL
-    "cache_read": 0.10,    # 0.1× input
+    "cache_write": 1.25,
+    "cache_read": 0.10,
 }
 
-MEP_TAB = "MEPs "  # the trailing space is in the source sheet, not a typo
+MEP_TAB = "MEPs "  # trailing space is in the source sheet, not a typo
 MEP_FIELDS = [
     "Last Name", "First Name", "Country", "Group", "National party",
     "New vs. re-elected", "ENVI", "TRAN", "ITRE",
@@ -52,7 +67,13 @@ MEP_FIELDS = [
 MEP_TWITTER_COLUMN_INDEX = 20  # column U
 MEP_HEADER_ROW_INDEX = 1       # row 2 in the sheet (row 1 is a section banner)
 
-OUTPUT_TAB = "full_dataset"
+FULL_DATASET_TAB = "full_dataset"
+
+PLATFORM_TYPE_BY_HOST: dict[frozenset[str], str] = {
+    frozenset(X_HOSTS): "twitter",
+    frozenset(FACEBOOK_HOSTS): "facebook",
+    frozenset(INSTAGRAM_HOSTS): "instagram",
+}
 
 
 @dataclass(frozen=True)
@@ -60,6 +81,7 @@ class Config:
     model: str
     role: str
     minimum_characters: int
+    include_past_days: int
 
 
 @dataclass(frozen=True)
@@ -77,6 +99,15 @@ class Comment:
     social_media_address: str
     comment: str
     timestamp: str
+
+
+@dataclass
+class ProcessedComment:
+    comment: Comment
+    social_media_type: str
+    parsed_date: date | None
+    mep: dict[str, str] = field(default_factory=dict)
+    answers: dict[str, str] = field(default_factory=dict)
 
 
 def setup_logging(log_dir: Path) -> Path:
@@ -100,6 +131,25 @@ def sheets_service(service_account_file: Path):
     return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
 
+def existing_tabs(service, spreadsheet_id: str) -> set[str]:
+    meta = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    return {s["properties"]["title"] for s in meta.get("sheets", [])}
+
+
+def detect_platform(url: str) -> str:
+    if not url:
+        return ""
+    host = urlparse(url).netloc.lower().removeprefix("www.")
+    for hosts, label in PLATFORM_TYPE_BY_HOST.items():
+        if host in hosts:
+            return label
+    return host  # fall through with the bare host so it's still informative
+
+
+def parse_ddmmyyyy(s: str) -> date:
+    return datetime.strptime(s.strip(), "%d%m%Y").date()
+
+
 def fetch_grid(service, spreadsheet_id: str, tab: str) -> list[list[dict]]:
     fields = "sheets.data.rowData.values(formattedValue,hyperlink,textFormatRuns(format/link/uri))"
     response = service.spreadsheets().get(
@@ -120,6 +170,7 @@ def load_config(service, spreadsheet_id: str) -> Config:
         model=kv["claude_model_selection"],
         role=kv["claude_role"],
         minimum_characters=int(kv["minimum_characters"]),
+        include_past_days=int(kv.get("include_past_days", "365000")),
     )
 
 
@@ -163,7 +214,6 @@ def load_comments(csv_path: Path) -> list[Comment]:
 
 
 def load_mep_lookup(service, spreadsheet_id: str) -> dict[str, dict[str, str]]:
-    """Return {normalised_twitter_url: {field: value, ...}} for every MEP with a Twitter URL."""
     grid = fetch_grid(service, spreadsheet_id, MEP_TAB)
     if len(grid) <= MEP_HEADER_ROW_INDEX:
         logging.warning(f"MEPs tab has no data rows (got {len(grid)} rows)")
@@ -178,7 +228,6 @@ def load_mep_lookup(service, spreadsheet_id: str) -> dict[str, dict[str, str]]:
     logging.info(f"MEPs field indices: {field_index}")
 
     lookup: dict[str, dict[str, str]] = {}
-    matched_twitter = 0
     for row in data_rows:
         if MEP_TWITTER_COLUMN_INDEX >= len(row):
             continue
@@ -188,13 +237,11 @@ def load_mep_lookup(service, spreadsheet_id: str) -> dict[str, dict[str, str]]:
         norm = normalise(twitter_url, "X (Twitter)")
         if not isinstance(norm, Handle):
             continue
-        matched_twitter += 1
-        record = {
+        lookup[norm.url] = {
             field: (row[idx].get("formattedValue") or "").strip() if idx < len(row) else ""
             for field, idx in field_index.items()
         }
-        lookup[norm.url] = record
-    logging.info(f"Built MEP lookup: {len(lookup)} unique twitter URLs from {matched_twitter} cells")
+    logging.info(f"Built MEP lookup: {len(lookup)} unique twitter URLs")
     return lookup
 
 
@@ -210,15 +257,13 @@ VERDICT_SCHEMA = {
 
 
 def ask_claude(client: anthropic.Anthropic, config: Config, question: Question, comment: str) -> dict:
-    """One classification call. Structured output, cached system prefix."""
     system_blocks = [
         {"type": "text", "text": config.role},
         {
             "type": "text",
             "text": (
-                "Answer this question about the comment. Reply with verdict "
-                f'"yes" or "no" and a one-sentence justification.\n\n'
-                f"Question: {question.question}"
+                'Answer this question about the comment. Reply with verdict "yes" or "no" '
+                f"and a one-sentence justification.\n\nQuestion: {question.question}"
             ),
             "cache_control": {"type": "ephemeral"},
         },
@@ -257,7 +302,6 @@ def estimate_cost(in_tok: int, out_tok: int, cache_w: int, cache_r: int) -> floa
 
 
 def group_questions(questions: list[Question]) -> dict[str, dict]:
-    """Group questions by question_group. Each group → {"root": Question, "follow_ups": [Question, ...]}."""
     groups: dict[str, dict] = defaultdict(lambda: {"root": None, "follow_ups": []})
     for q in questions:
         key = q.question_group or q.question_id
@@ -271,8 +315,85 @@ def group_questions(questions: list[Question]) -> dict[str, dict]:
     return dict(groups)
 
 
+def filter_by_date(comments: list[Comment], config: Config, today: date) -> list[tuple[Comment, date | None]]:
+    """Return (comment, parsed_date) for each comment that passes the date filter."""
+    cutoff = today - timedelta(days=config.include_past_days)
+    logging.info(f"Date filter: today={today.isoformat()}, include_past_days={config.include_past_days}, cutoff={cutoff.isoformat()}")
+    out: list[tuple[Comment, date | None]] = []
+    skipped = 0
+    unparseable = 0
+    for c in comments:
+        try:
+            d = parse_ddmmyyyy(c.timestamp)
+        except ValueError:
+            logging.warning(f"  unparseable timestamp {c.timestamp!r} for {c.social_media_address} — keeping")
+            out.append((c, None))
+            unparseable += 1
+            continue
+        if d < cutoff:
+            logging.info(f"  SKIP old ({d.isoformat()}, {(today - d).days}d > {config.include_past_days}d) {c.social_media_address}")
+            skipped += 1
+            continue
+        out.append((c, d))
+    logging.info(f"Date filter result: kept {len(out)}, skipped {skipped} as too old, {unparseable} unparseable timestamps kept")
+    return out
+
+
+def question_column_names(questions: list[Question]) -> list[tuple[str, Question]]:
+    """Ordered list of (column_name, source_question), interleaved verdict + justification."""
+    out: list[tuple[str, Question]] = []
+    for q in questions:
+        out.append((f"{q.question_tag}_verdict", q))
+        out.append((f"{q.question_tag}_justification", q))
+    return out
+
+
+def build_full_dataset_rows(processed: list[ProcessedComment], questions: list[Question]) -> list[list[str]]:
+    cols = question_column_names(questions)
+    header = (
+        MEP_FIELDS
+        + ["social_media_type", "social_media_address", "comment", "timestamp"]
+        + [name for name, _ in cols]
+    )
+    rows: list[list[str]] = [header]
+    for p in processed:
+        rows.append(
+            [p.mep.get(f, "") for f in MEP_FIELDS]
+            + [p.social_media_type, p.comment.social_media_address, p.comment.comment, p.comment.timestamp]
+            + [p.answers.get(name, "") for name, _ in cols]
+        )
+    return rows
+
+
+def build_group_rows(group_name: str, group: dict, processed: list[ProcessedComment]) -> list[list[str]]:
+    """One row per comment where the group's root verdict is 'yes'. Follow-up cols only."""
+    root_q: Question | None = group["root"]
+    follow_ups: list[Question] = group["follow_ups"]
+    if root_q is None:
+        logging.warning(f"  group {group_name!r} has no root question — building tab without filter")
+    if not follow_ups:
+        logging.warning(f"  group {group_name!r} has no follow-ups — output will only contain MEP+comment columns")
+
+    cols = question_column_names(follow_ups)
+    header = (
+        MEP_FIELDS
+        + ["social_media_type", "social_media_address", "comment", "timestamp"]
+        + [name for name, _ in cols]
+    )
+    rows: list[list[str]] = [header]
+    root_key = f"{root_q.question_tag}_verdict" if root_q else None
+    for p in processed:
+        if root_key and p.answers.get(root_key) != "yes":
+            continue
+        rows.append(
+            [p.mep.get(f, "") for f in MEP_FIELDS]
+            + [p.social_media_type, p.comment.social_media_address, p.comment.comment, p.comment.timestamp]
+            + [p.answers.get(name, "") for name, _ in cols]
+        )
+    return rows
+
+
 def write_to_sheet(service, spreadsheet_id: str, tab: str, rows: list[list]) -> None:
-    """Clear `tab` and write `rows` starting at A1. Requires Editor permission."""
     service.spreadsheets().values().clear(
         spreadsheetId=spreadsheet_id, range=tab, body={},
     ).execute()
@@ -281,6 +402,75 @@ def write_to_sheet(service, spreadsheet_id: str, tab: str, rows: list[list]) -> 
         valueInputOption="USER_ENTERED",
         body={"values": rows},
     ).execute()
+
+
+def write_csv(path: Path, rows: list[list]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as f:
+        csv.writer(f).writerows(rows)
+
+
+def classify_one_comment(
+    client: anthropic.Anthropic,
+    config: Config,
+    groups: dict[str, dict],
+    comment_text: str,
+    label: str,
+    totals: dict,
+) -> dict[str, str]:
+    """Run all groups against one comment, return {col_name: value}. Updates totals in place."""
+    answers: dict[str, str] = {}
+    for gname, g in groups.items():
+        root_q = g["root"]
+        if root_q is None:
+            logging.warning(f"  group {gname!r} has no root; running follow-ups directly")
+            runlist = g["follow_ups"]
+            gate_passed = True
+        else:
+            try:
+                result = ask_claude(client, config, root_q, comment_text)
+            except Exception as e:
+                logging.exception(f"  root Q{root_q.question_id} failed: {e}")
+                totals["errors"] += 1
+                continue
+            _accumulate(totals, result)
+            logging.info(
+                f"  Q{root_q.question_id} [root     {root_q.question_tag}] -> {result['verdict']:3}  "
+                f"in={result['input_tokens']:>4} out={result['output_tokens']:>4} "
+                f"cw={result['cache_creation_input_tokens']} cr={result['cache_read_input_tokens']} "
+                f"{result['elapsed_seconds']}s"
+            )
+            logging.debug(f"     justification: {result['justification']}")
+            answers[f"{root_q.question_tag}_verdict"] = result["verdict"]
+            answers[f"{root_q.question_tag}_justification"] = result["justification"]
+            gate_passed = result["verdict"] == "yes"
+            runlist = g["follow_ups"]
+
+        if not gate_passed:
+            for fq in runlist:
+                answers[f"{fq.question_tag}_verdict"] = "skipped"
+                answers[f"{fq.question_tag}_justification"] = "root verdict was 'no'"
+                totals["skipped_followup"] += 1
+            logging.info(f"     root='no' -> skipped {len(runlist)} follow-up(s)")
+            continue
+
+        for fq in runlist:
+            try:
+                result = ask_claude(client, config, fq, comment_text)
+            except Exception as e:
+                logging.exception(f"  follow-up Q{fq.question_id} failed: {e}")
+                totals["errors"] += 1
+                continue
+            _accumulate(totals, result)
+            logging.info(
+                f"  Q{fq.question_id} [follow-up {fq.question_tag}] -> {result['verdict']:3}  "
+                f"in={result['input_tokens']:>4} out={result['output_tokens']:>4} "
+                f"cw={result['cache_creation_input_tokens']} cr={result['cache_read_input_tokens']} "
+                f"{result['elapsed_seconds']}s"
+            )
+            logging.debug(f"     justification: {result['justification']}")
+            answers[f"{fq.question_tag}_verdict"] = result["verdict"]
+            answers[f"{fq.question_tag}_justification"] = result["justification"]
+    return answers
 
 
 def main() -> int:
@@ -297,7 +487,6 @@ def main() -> int:
     mep_spreadsheet_id = os.environ["SPREADSHEET_ID"]
     config_spreadsheet_id = os.environ["CONFIG_SPREADSHEET_ID"]
     comments_csv = output_dir / "test_comments.csv"
-
     if not comments_csv.exists():
         logging.error(f"Missing input file: {comments_csv}")
         return 1
@@ -308,6 +497,7 @@ def main() -> int:
     config = load_config(service, config_spreadsheet_id)
     logging.info(f"  model              = {config.model}")
     logging.info(f"  minimum_characters = {config.minimum_characters}")
+    logging.info(f"  include_past_days  = {config.include_past_days}")
     logging.info(f"  role               = {config.role!r}")
 
     questions = load_questions(service, config_spreadsheet_id)
@@ -321,43 +511,32 @@ def main() -> int:
         followups = [f.question_tag for f in g["follow_ups"]]
         logging.info(f"  {gname}: root={root}, follow_ups={followups}")
 
-    logging.info(f"Loading MEP lookup from {mep_spreadsheet_id} / '{MEP_TAB}' tab")
+    logging.info(f"Loading MEP lookup from {mep_spreadsheet_id} / '{MEP_TAB}'")
     mep_lookup = load_mep_lookup(service, mep_spreadsheet_id)
 
-    comments = load_comments(comments_csv)
-    logging.info(f"Loaded {len(comments)} comment(s) from {comments_csv}")
+    raw_comments = load_comments(comments_csv)
+    logging.info(f"Loaded {len(raw_comments)} comment(s) from {comments_csv}")
+
+    today = datetime.now().date()
+    dated_comments = filter_by_date(raw_comments, config, today)
 
     client = anthropic.Anthropic()
     logging.info("Anthropic client initialised")
 
-    # Build output columns
-    question_columns: list[tuple[str, Question]] = []
-    for q in questions:  # preserve sheet order
-        question_columns.append((f"{q.question_tag}_verdict", q))
-        question_columns.append((f"{q.question_tag}_justification", q))
-    header_row = (
-        MEP_FIELDS
-        + ["social_media_address", "comment", "timestamp"]
-        + [name for name, _ in question_columns]
-    )
-    output_rows: list[list] = [header_row]
-
-    # Local CSV mirror of the wide output (handy when sheet write fails)
-    csv_mirror = output_dir / "full_dataset.csv"
-
-    totals = {"calls": 0, "skipped_short": 0, "skipped_followup": 0, "errors": 0,
+    processed: list[ProcessedComment] = []
+    totals = {"calls": 0, "skipped_short": 0, "skipped_old": len(raw_comments) - len(dated_comments),
+              "skipped_followup": 0, "errors": 0,
               "input_tokens": 0, "output_tokens": 0, "cache_w": 0, "cache_r": 0, "elapsed": 0.0}
-    mep_hits = 0
-    mep_misses = 0
+    mep_hits = mep_misses = 0
 
-    for i, c in enumerate(comments, start=1):
+    for i, (c, parsed_date) in enumerate(dated_comments, start=1):
         comment_len = len(c.comment)
         if comment_len < config.minimum_characters:
-            logging.info(f"[{i}/{len(comments)}] SKIP short ({comment_len} < {config.minimum_characters}) {c.social_media_address}")
+            logging.info(f"[{i}/{len(dated_comments)}] SKIP short ({comment_len} < {config.minimum_characters}) {c.social_media_address}")
             totals["skipped_short"] += 1
             continue
 
-        # MEP lookup (left join — keep row even if no match)
+        platform_type = detect_platform(c.social_media_address)
         norm = normalise(c.social_media_address, "X (Twitter)")
         mep_record: dict[str, str] = {}
         if isinstance(norm, Handle):
@@ -369,83 +548,56 @@ def main() -> int:
                 logging.warning(f"  no MEP match for {norm.url}")
         else:
             mep_misses += 1
-            logging.warning(f"  could not normalise {c.social_media_address!r}: {norm.reason}")
+            logging.warning(f"  could not normalise {c.social_media_address!r}: {getattr(norm, 'reason', '?')}")
 
-        # Per-question answers, keyed by column name
-        answers: dict[str, str] = {name: "" for name, _ in question_columns}
-
-        logging.info(f"[{i}/{len(comments)}] {c.social_media_address}  ({comment_len} chars)  mep={mep_record.get('Last Name','') or '<no match>'}")
-        for gname, g in groups.items():
-            root_q = g["root"]
-            if root_q is None:
-                logging.warning(f"  group {gname!r} has no root; running follow-ups directly")
-                runlist = g["follow_ups"]
-                gate_passed = True
-            else:
-                # Run root
-                try:
-                    result = ask_claude(client, config, root_q, c.comment)
-                except Exception as e:
-                    logging.exception(f"  root Q{root_q.question_id} failed: {e}")
-                    totals["errors"] += 1
-                    continue
-                _accumulate(totals, result)
-                logging.info(f"  Q{root_q.question_id} [root        {root_q.question_tag}] -> {result['verdict']:3}  in={result['input_tokens']:>4} out={result['output_tokens']:>4} cw={result['cache_creation_input_tokens']} cr={result['cache_read_input_tokens']} {result['elapsed_seconds']}s")
-                logging.debug(f"     justification: {result['justification']}")
-                answers[f"{root_q.question_tag}_verdict"] = result["verdict"]
-                answers[f"{root_q.question_tag}_justification"] = result["justification"]
-                gate_passed = result["verdict"] == "yes"
-                runlist = g["follow_ups"]
-
-            if not gate_passed:
-                for fq in runlist:
-                    answers[f"{fq.question_tag}_verdict"] = "skipped"
-                    answers[f"{fq.question_tag}_justification"] = "root verdict was 'no'"
-                    totals["skipped_followup"] += 1
-                logging.info(f"     root='no' -> skipped {len(runlist)} follow-up(s)")
-                continue
-
-            for fq in runlist:
-                try:
-                    result = ask_claude(client, config, fq, c.comment)
-                except Exception as e:
-                    logging.exception(f"  follow-up Q{fq.question_id} failed: {e}")
-                    totals["errors"] += 1
-                    continue
-                _accumulate(totals, result)
-                logging.info(f"  Q{fq.question_id} [follow_up   {fq.question_tag}] -> {result['verdict']:3}  in={result['input_tokens']:>4} out={result['output_tokens']:>4} cw={result['cache_creation_input_tokens']} cr={result['cache_read_input_tokens']} {result['elapsed_seconds']}s")
-                logging.debug(f"     justification: {result['justification']}")
-                answers[f"{fq.question_tag}_verdict"] = result["verdict"]
-                answers[f"{fq.question_tag}_justification"] = result["justification"]
-
-        # Assemble the wide row
-        row = (
-            [mep_record.get(f, "") for f in MEP_FIELDS]
-            + [c.social_media_address, c.comment, c.timestamp]
-            + [answers[name] for name, _ in question_columns]
+        logging.info(
+            f"[{i}/{len(dated_comments)}] {c.social_media_address}  "
+            f"({comment_len} chars, platform={platform_type}, mep={mep_record.get('Last Name','') or '<no match>'})"
         )
-        output_rows.append(row)
 
-    # Local CSV mirror
-    with csv_mirror.open("w", encoding="utf-8", newline="") as f:
-        csv.writer(f).writerows(output_rows)
-    logging.info(f"Wrote local mirror -> {csv_mirror}")
+        answers = classify_one_comment(client, config, groups, c.comment, c.social_media_address, totals)
 
-    # Write to Google Sheet
+        processed.append(ProcessedComment(
+            comment=c,
+            social_media_type=platform_type,
+            parsed_date=parsed_date,
+            mep=mep_record,
+            answers=answers,
+        ))
+
+    # Build outputs
+    full_rows = build_full_dataset_rows(processed, questions)
+    write_csv(output_dir / "full_dataset.csv", full_rows)
+    logging.info(f"Wrote local mirror -> {output_dir / 'full_dataset.csv'}")
+
+    sheet_tabs = existing_tabs(service, config_spreadsheet_id)
     try:
-        logging.info(f"Writing {len(output_rows)-1} rows to {config_spreadsheet_id} / '{OUTPUT_TAB}'")
-        write_to_sheet(service, config_spreadsheet_id, OUTPUT_TAB, output_rows)
-        logging.info(f"  -> wrote to https://docs.google.com/spreadsheets/d/{config_spreadsheet_id}/edit#gid=...")
+        write_to_sheet(service, config_spreadsheet_id, FULL_DATASET_TAB, full_rows)
+        logging.info(f"Wrote {len(full_rows)-1} rows to {FULL_DATASET_TAB!r} tab")
     except Exception as e:
-        logging.error(f"Sheet write failed: {type(e).__name__}: {e}")
-        logging.error("  (most likely cause: service account is Viewer; grant Editor on the sheet)")
+        logging.error(f"Sheet write failed for {FULL_DATASET_TAB}: {type(e).__name__}: {e}")
 
-    # Summary
+    for gname, g in groups.items():
+        group_rows = build_group_rows(gname, g, processed)
+        local = output_dir / f"{gname}.csv"
+        write_csv(local, group_rows)
+        logging.info(f"Wrote local mirror -> {local} ({len(group_rows)-1} matching rows)")
+        if gname not in sheet_tabs:
+            logging.info(f"  Skipping sheet write for group {gname!r}: tab does not exist (create it in the sheet to enable)")
+            continue
+        try:
+            write_to_sheet(service, config_spreadsheet_id, gname, group_rows)
+            logging.info(f"  Wrote {len(group_rows)-1} rows to {gname!r} tab")
+        except Exception as e:
+            logging.error(f"  Sheet write failed for {gname}: {type(e).__name__}: {e}")
+
     cost = estimate_cost(totals["input_tokens"], totals["output_tokens"], totals["cache_w"], totals["cache_r"])
     logging.info("=" * 78)
     logging.info("Run summary")
-    logging.info(f"  comments processed       = {len(comments)}")
+    logging.info(f"  comments loaded          = {len(raw_comments)}")
+    logging.info(f"  skipped (too old)        = {totals['skipped_old']}")
     logging.info(f"  skipped (too short)      = {totals['skipped_short']}")
+    logging.info(f"  comments processed       = {len(processed)}")
     logging.info(f"  follow-ups skipped (gate)= {totals['skipped_followup']}")
     logging.info(f"  API calls                = {totals['calls']}")
     logging.info(f"  errors                   = {totals['errors']}")
