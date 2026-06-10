@@ -2,4 +2,4 @@ gspread==6.1.4
 google-auth==2.35.0
 google-api-python-client==2.149.0
 python-dotenv==1.0.1
-anthropic==0.40.0
+anthropic==0.109.1

@@ -4,5 +4,6 @@ __pycache__/
 .env
 service_account.json
 data/
+logs/
 .idea/
 .vscode/
