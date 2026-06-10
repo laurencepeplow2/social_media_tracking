@@ -249,9 +249,8 @@ VERDICT_SCHEMA = {
     "type": "object",
     "properties": {
         "verdict": {"type": "string", "enum": ["yes", "no"]},
-        "justification": {"type": "string"},
     },
-    "required": ["verdict", "justification"],
+    "required": ["verdict"],
     "additionalProperties": False,
 }
 
@@ -261,17 +260,14 @@ def ask_claude(client: anthropic.Anthropic, config: Config, question: Question, 
         {"type": "text", "text": config.role},
         {
             "type": "text",
-            "text": (
-                'Answer this question about the comment. Reply with verdict "yes" or "no" '
-                f"and a one-sentence justification.\n\nQuestion: {question.question}"
-            ),
+            "text": f'Answer this question about the comment with "yes" or "no".\n\nQuestion: {question.question}',
             "cache_control": {"type": "ephemeral"},
         },
     ]
     start = time.monotonic()
     response = client.messages.create(
         model=config.model,
-        max_tokens=512,
+        max_tokens=32,
         system=system_blocks,
         messages=[{"role": "user", "content": f'Comment:\n"""\n{comment}\n"""'}],
         output_config={"format": {"type": "json_schema", "schema": VERDICT_SCHEMA}},
@@ -282,7 +278,6 @@ def ask_claude(client: anthropic.Anthropic, config: Config, question: Question, 
     usage = response.usage
     return {
         "verdict": parsed.get("verdict", ""),
-        "justification": parsed.get("justification", ""),
         "input_tokens": usage.input_tokens,
         "output_tokens": usage.output_tokens,
         "cache_creation_input_tokens": getattr(usage, "cache_creation_input_tokens", 0) or 0,
@@ -340,12 +335,8 @@ def filter_by_date(comments: list[Comment], config: Config, today: date) -> list
 
 
 def question_column_names(questions: list[Question]) -> list[tuple[str, Question]]:
-    """Ordered list of (column_name, source_question), interleaved verdict + justification."""
-    out: list[tuple[str, Question]] = []
-    for q in questions:
-        out.append((f"{q.question_tag}_verdict", q))
-        out.append((f"{q.question_tag}_justification", q))
-    return out
+    """Ordered list of (column_name, source_question). One verdict column per question."""
+    return [(f"{q.question_tag}_verdict", q) for q in questions]
 
 
 def build_full_dataset_rows(processed: list[ProcessedComment], questions: list[Question]) -> list[list[str]]:
@@ -439,16 +430,13 @@ def classify_one_comment(
                 f"cw={result['cache_creation_input_tokens']} cr={result['cache_read_input_tokens']} "
                 f"{result['elapsed_seconds']}s"
             )
-            logging.debug(f"     justification: {result['justification']}")
             answers[f"{root_q.question_tag}_verdict"] = result["verdict"]
-            answers[f"{root_q.question_tag}_justification"] = result["justification"]
             gate_passed = result["verdict"] == "yes"
             runlist = g["follow_ups"]
 
         if not gate_passed:
             for fq in runlist:
                 answers[f"{fq.question_tag}_verdict"] = "skipped"
-                answers[f"{fq.question_tag}_justification"] = "root verdict was 'no'"
                 totals["skipped_followup"] += 1
             logging.info(f"     root='no' -> skipped {len(runlist)} follow-up(s)")
             continue
@@ -467,9 +455,7 @@ def classify_one_comment(
                 f"cw={result['cache_creation_input_tokens']} cr={result['cache_read_input_tokens']} "
                 f"{result['elapsed_seconds']}s"
             )
-            logging.debug(f"     justification: {result['justification']}")
             answers[f"{fq.question_tag}_verdict"] = result["verdict"]
-            answers[f"{fq.question_tag}_justification"] = result["justification"]
     return answers
 
 
